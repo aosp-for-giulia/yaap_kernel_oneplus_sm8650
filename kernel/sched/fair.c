@@ -782,7 +782,7 @@ void update_zero_vruntime(struct cfs_rq *cfs_rq, s64 delta)
  * Called in:
  *  - place_entity()      -- before enqueue
  *  - update_entity_lag() -- before dequeue
- *  - entity_tick()
+ *  - update_deadline()   -- slice expiration
  *
  * This means it is one entry 'behind' but that puts it close enough to where
  * the bound on entity_key() is at most two lag bounds.
@@ -850,11 +850,33 @@ static s64 entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se, u64 avrunt
 	return clamp(vlag, -limit, limit);
 }
 
-static void update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
+/*
+ * Delayed dequeue aims to reduce the negative lag of a dequeued task. While
+ * updating the lag of an entity, check that negative lag didn't increase
+ * during the delayed dequeue period which would be unfair.
+ * Similarly, check that the entity didn't gain positive lag when DELAY_ZERO
+ * is set.
+ *
+ * Return true if the lag has been adjusted.
+ */
+static __always_inline
+bool update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
+	s64 vlag = entity_lag(cfs_rq, se, avg_vruntime(cfs_rq));
+	bool ret;
+
 	SCHED_WARN_ON(!se->on_rq);
 
-	se->vlag = entity_lag(cfs_rq, se, avg_vruntime(cfs_rq));
+	if (se->sched_delayed) {
+		/* previous vlag < 0 otherwise se would not be delayed */
+		vlag = max(vlag, se->vlag);
+		if (sched_feat(DELAY_ZERO))
+			vlag = min(vlag, 0);
+	}
+	ret = (vlag == se->vlag);
+	se->vlag = vlag;
+
+	return ret;
 }
 
 /*
@@ -865,11 +887,11 @@ static void update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
  *
  * lag_i >= 0 -> V >= v_i
  *
- *     \Sum (v_i - v)*w_i
- * V = ------------------ + v
+ *     \Sum (v_i - v0)*w_i
+ * V = ------------------- + v0
  *          \Sum w_i
  *
- * lag_i >= 0 -> \Sum (v_i - v)*w_i >= (v_i - v)*(\Sum w_i)
+ * lag_i >= 0 -> \Sum (v_i - v0)*w_i >= (v_i - v0)*(\Sum w_i)
  *
  * Note: using 'avg_vruntime() > se->vruntime' is inacurate due
  *       to the loss in precision caused by the division.
@@ -877,7 +899,7 @@ static void update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
 static int vruntime_eligible(struct cfs_rq *cfs_rq, u64 vruntime)
 {
 	struct sched_entity *curr = cfs_rq->curr;
-	s64 avg = cfs_rq->sum_w_vruntime;
+	s64 key, avg = cfs_rq->sum_w_vruntime;
 	long load = cfs_rq->sum_weight;
 
 	if (curr && curr->on_rq) {
@@ -887,7 +909,36 @@ static int vruntime_eligible(struct cfs_rq *cfs_rq, u64 vruntime)
 		load += weight;
 	}
 
-	return avg >= vruntime_op(vruntime, "-", cfs_rq->zero_vruntime) * load;
+	key = vruntime_op(vruntime, "-", cfs_rq->zero_vruntime);
+
+	/*
+	 * The worst case term for @key includes 'NSEC_TICK * NICE_0_LOAD'
+	 * and @load obviously includes NICE_0_LOAD. NSEC_TICK is around 24
+	 * bits, while NICE_0_LOAD is 20 on 64bit and 10 otherwise.
+	 *
+	 * This gives that on 64bit the product will be at least 64bit which
+	 * overflows s64, while on 32bit it will only be 44bits and should fit
+	 * comfortably.
+	 */
+#ifdef CONFIG_64BIT
+#ifdef CONFIG_ARCH_SUPPORTS_INT128
+	/* This often results in simpler code than __builtin_mul_overflow(). */
+	return avg >= (__int128)key * load;
+#else
+	s64 rhs;
+	/*
+	 * On overflow, the sign of key tells us the correct answer: a large
+	 * positive key means vruntime >> V, so not eligible; a large negative
+	 * key means vruntime << V, so eligible.
+	 */
+	if (check_mul_overflow(key, load, &rhs))
+		return key <= 0;
+
+	return avg >= rhs;
+#endif
+#else /* 32bit */
+	return avg >= key * load;
+#endif
 }
 
 int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se)
@@ -1092,7 +1143,7 @@ static inline void cancel_protect_slice(struct sched_entity *se)
  *
  * Which allows tree pruning through eligibility.
  */
-static struct sched_entity *__pick_eevdf(struct cfs_rq *cfs_rq, bool protect)
+static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq, bool protect)
 {
 	struct rb_node *node = cfs_rq->tasks_timeline.rb_root.rb_node;
 	struct sched_entity *se = __pick_first_entity(cfs_rq);
@@ -1163,11 +1214,6 @@ found:
 	return best;
 }
 
-static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
-{
-        return __pick_eevdf(cfs_rq, true);
-}
-
 #ifdef CONFIG_SCHED_DEBUG
 struct sched_entity *__pick_last_entity(struct cfs_rq *cfs_rq)
 {
@@ -1226,6 +1272,7 @@ static bool update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	 * EEVDF: vd_i = ve_i + r_i / w_i
 	 */
 	se->deadline = se->vruntime + calc_delta_fair(se->slice, se);
+	avg_vruntime(cfs_rq);
 
 	/*
 	 * The task has consumed its request, reschedule.
@@ -5264,6 +5311,7 @@ static void
 place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
 	u64 vslice, vruntime = avg_vruntime(cfs_rq);
+	bool update_zero = false;
 	s64 lag = 0;
 
 	if (!se->custom_slice)
@@ -5280,7 +5328,7 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 */
 	if (sched_feat(PLACE_LAG) && cfs_rq->nr_queued && se->vlag) {
 		struct sched_entity *curr = cfs_rq->curr;
-		long load;
+		long load, weight;
 
 		lag = se->vlag;
 
@@ -5340,13 +5388,40 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 		if (curr && curr->on_rq)
 			load += avg_vruntime_weight(cfs_rq, curr->load.weight);
 
-		lag *= load + avg_vruntime_weight(cfs_rq, se->load.weight);
+		weight = avg_vruntime_weight(cfs_rq, se->load.weight);
+		lag *= load + weight;
 		if (WARN_ON_ONCE(!load))
 			load = 1;
 		lag = div64_long(lag, load);
+
+		/*
+		 * A heavy entity (relative to the tree) will pull the
+		 * avg_vruntime close to its vruntime position on enqueue. But
+		 * the zero_vruntime point is only updated at the next
+		 * update_deadline()/place_entity()/update_entity_lag().
+		 *
+		 * Specifically (see the comment near avg_vruntime_weight()):
+		 *
+		 *   sum_w_vruntime = \Sum (v_i - v0) * w_i
+		 *
+		 * Note that if v0 is near a light entity, both terms will be
+		 * small for the light entity, while in that case both terms
+		 * are large for the heavy entity, leading to risk of
+		 * overflow.
+		 *
+		 * OTOH if v0 is near the heavy entity, then the difference is
+		 * larger for the light entity, but the factor is small, while
+		 * for the heavy entity the difference is small but the factor
+		 * is large. Avoiding the multiplication overflow.
+		 */
+		if (weight > load)
+			update_zero = true;
 	}
 
 	se->vruntime = vruntime - lag;
+
+	if (update_zero)
+		update_zero_vruntime(cfs_rq, -lag);
 
 	if (sched_feat(PLACE_REL_DEADLINE) && se->rel_deadline) {
 		se->deadline += se->vruntime;
@@ -5507,13 +5582,6 @@ static void clear_delayed(struct sched_entity *se)
 	}
 }
 
-static inline void finish_delayed_dequeue_entity(struct sched_entity *se)
-{
-	clear_delayed(se);
-	if (sched_feat(DELAY_ZERO) && se->vlag > 0)
-		se->vlag = 0;
-}
-
 static bool
 dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
@@ -5542,6 +5610,7 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 		if (sched_feat(DELAY_DEQUEUE) && delay &&
 		    !entity_eligible(cfs_rq, se)) {
 			update_load_avg(cfs_rq, se, 0);
+			update_entity_lag(cfs_rq, se);
 			set_delayed(se);
 			return false;
 		}
@@ -5578,7 +5647,7 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	update_cfs_group(se);
 
 	if (flags & DEQUEUE_DELAYED)
-		finish_delayed_dequeue_entity(se);
+		clear_delayed(se);
 
 	if (cfs_rq->nr_queued == 0) {
 		update_idle_cfs_rq_clock_pelt(cfs_rq);
@@ -5648,9 +5717,9 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags);
  * 4) do not run the "skip" process, if something else is available
  */
 static struct sched_entity *
-pick_next_entity(struct rq *rq, struct cfs_rq *cfs_rq)
+pick_next_entity(struct rq *rq, struct cfs_rq *cfs_rq, bool protect)
 {
-	struct sched_entity *se = pick_eevdf(cfs_rq);
+	struct sched_entity *se = pick_eevdf(cfs_rq, protect);
 
 	if (se->sched_delayed) {
 		dequeue_entities(rq, se, DEQUEUE_SLEEP | DEQUEUE_DELAYED);
@@ -5700,11 +5769,6 @@ entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued)
 	 */
 	update_load_avg(cfs_rq, curr, UPDATE_TG);
 	update_cfs_group(curr);
-
-	/*
-	 * Pulls along cfs_rq::zero_vruntime.
-	 */
-	avg_vruntime(cfs_rq);
 
 #ifdef CONFIG_SCHED_HRTICK
 	/*
@@ -7030,18 +7094,14 @@ requeue_delayed_entity(struct sched_entity *se)
 	SCHED_WARN_ON(!se->sched_delayed);
 	SCHED_WARN_ON(!se->on_rq);
 
-	if (sched_feat(DELAY_ZERO)) {
-		update_entity_lag(cfs_rq, se);
-		if (se->vlag > 0) {
-			cfs_rq->nr_queued--;
-			if (se != cfs_rq->curr)
-				__dequeue_entity(cfs_rq, se);
-			se->vlag = 0;
-			place_entity(cfs_rq, se, 0);
-			if (se != cfs_rq->curr)
-				__enqueue_entity(cfs_rq, se);
-			cfs_rq->nr_queued++;
-		}
+	if (update_entity_lag(cfs_rq, se)) {
+		cfs_rq->nr_queued--;
+		if (se != cfs_rq->curr)
+			__dequeue_entity(cfs_rq, se);
+		place_entity(cfs_rq, se, 0);
+		if (se != cfs_rq->curr)
+			__enqueue_entity(cfs_rq, se);
+		cfs_rq->nr_queued++;
 	}
 
 	update_load_avg(cfs_rq, se, 0);
@@ -8771,7 +8831,7 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 {
 	enum preempt_wakeup_action preempt_action = PREEMPT_WAKEUP_PICK;
 	struct task_struct *curr = rq->curr;
-	struct sched_entity *se = &curr->se, *pse = &p->se;
+	struct sched_entity *nse, *se = &curr->se, *pse = &p->se;
 	struct cfs_rq *cfs_rq = task_cfs_rq(curr);
 	int cse_is_idle, pse_is_idle;
 	bool ignore = false;
@@ -8884,11 +8944,18 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	}
 
 pick:
-	/*
-	 * If @p has become the most eligible task, force preemption.
-	 */
-	if (__pick_eevdf(cfs_rq, preempt_action != PREEMPT_WAKEUP_SHORT) == pse)
+	nse = pick_next_entity(rq, cfs_rq, preempt_action != PREEMPT_WAKEUP_SHORT);
+	/* If @p has become the most eligible task, force preemption */
+	if (nse == pse)
 		goto preempt;
+
+	/*
+	 * Because p is enqueued, nse being null can only mean that we
+	 * dequeued a delayed task. If there are still entities queued in
+	 * cfs, check if the next one will be p.
+	 */
+	if (!nse && cfs_rq->nr_queued)
+		goto pick;
 
 	if (sched_feat(RUN_TO_PARITY))
 		update_protect_slice(cfs_rq, se);
@@ -8923,7 +8990,7 @@ again:
 
 		throttled |= check_cfs_rq_runtime(cfs_rq);
 
-		se = pick_next_entity(rq, cfs_rq);
+		se = pick_next_entity(rq, cfs_rq, true);
 		if (!se)
 			goto again;
 		cfs_rq = group_cfs_rq(se);
@@ -9073,7 +9140,7 @@ static void yield_task_fair(struct rq *rq)
 	 */
 	if (entity_eligible(cfs_rq, se)) {
 		se->vruntime = se->deadline;
-		se->deadline += calc_delta_fair(se->slice, se);
+		update_deadline(cfs_rq, se);
 	}
 }
 
