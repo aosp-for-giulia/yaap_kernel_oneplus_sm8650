@@ -544,6 +544,7 @@ struct sched_entity {
 					/* hole */
 
 	u64				exec_start;
+	u64				delta_exec;
 	u64				sum_exec_runtime;
 	u64				prev_sum_exec_runtime;
 	u64				vruntime;
@@ -822,6 +823,8 @@ struct task_struct {
 	 */
 	struct uclamp_se		uclamp[UCLAMP_CNT];
 #endif
+
+	unsigned long			util_avg_dequeued;
 
 	struct sched_statistics         stats;
 
@@ -1509,6 +1512,10 @@ struct task_struct {
 #ifdef CONFIG_GCC_PLUGIN_STACKLEAK
 	unsigned long			lowest_stack;
 	unsigned long			prev_lowest_stack;
+#endif
+
+#ifdef CONFIG_RANDOMIZE_KSTACK_OFFSET
+	u32				kstack_offset;
 #endif
 
 #ifdef CONFIG_X86_MCE
